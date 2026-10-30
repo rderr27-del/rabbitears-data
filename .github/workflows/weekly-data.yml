@@ -40,6 +40,7 @@ jobs:
         shell: powershell
         run: |
           Remove-Item public\catalog.tsv
+          Remove-Item public\catalog-meta.tsv
           Remove-Item public\discover -Recurse
 
       - uses: actions/upload-artifact@v4

@@ -10,6 +10,10 @@
   best matches first without any ranking data of its own. Episode lists are NOT
   bundled; the app downloads a show's episodes once, when you add it.
 
+  It also writes catalog-meta.tsv (id <TAB> type <TAB> genres, "|"-separated),
+  which build-discover.ps1 uses for categories and to leave out news/talk shows.
+  The app doesn't need it, so it isn't published.
+
   The weekly GitHub workflow runs this; to run it by hand (~6 minutes):
       powershell -ExecutionPolicy Bypass -File tools\build-catalog.ps1
 #>
@@ -27,6 +31,7 @@ function Clean([string]$s) {
 }
 
 $rows = New-Object System.Collections.Generic.List[object]
+$meta = New-Object System.Collections.Generic.List[string]
 $page = 0
 while ($true) {
     try {
@@ -50,6 +55,7 @@ while ($true) {
             Weight = $weight
             Id     = [int]$s.id
         })
+        $meta.Add("$($s.id)`t$(Clean $s.type)`t$((@($s.genres) | ForEach-Object { Clean $_ }) -join '|')")
     }
     Write-Host "page $page -> $($rows.Count) shows"
     $page++
@@ -58,4 +64,5 @@ while ($true) {
 
 $lines = $rows | Sort-Object -Property @{ Expression = 'Weight'; Descending = $true }, Id | ForEach-Object { $_.Line }
 [System.IO.File]::WriteAllLines($out, [string[]]$lines, (New-Object System.Text.UTF8Encoding $false))
+[System.IO.File]::WriteAllLines((Join-Path $OutDir 'catalog-meta.tsv'), [string[]]$meta, (New-Object System.Text.UTF8Encoding $false))
 Write-Host "Wrote $($rows.Count) shows to $out"

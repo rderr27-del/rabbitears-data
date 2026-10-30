@@ -5,7 +5,7 @@
     catalog.tsv.gz          the search catalog, gzipped (~1.8 MB)
     discover.json           the Discover lists
     discover-posters.zip    the Discover posters (~3 MB)
-    manifest.json           what the app checks first: the version (build date)
+    manifest.json           what the app checks first: the version (build time, UTC)
                             plus each file's size and SHA-256, so the app can
                             verify downloads and skip files that didn't change
 
@@ -42,9 +42,11 @@ function Entry([string]$name) {
     }
 }
 
-$discover = [IO.File]::ReadAllText((Join-Path $OutDir 'discover.json'), [Text.Encoding]::UTF8) | ConvertFrom-Json
+# The version is the build's UTC date and time ("2026-10-30T0412Z"): it sorts as text,
+# a later build always counts as newer (even the same day), and it still sorts after
+# a bundled copy's plain date from that day.
 $manifest = [ordered]@{
-    version = $discover.updated
+    version = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd'T'HHmm'Z'")
     files   = [ordered]@{
         catalog  = Entry 'catalog.tsv.gz'
         discover = Entry 'discover.json'

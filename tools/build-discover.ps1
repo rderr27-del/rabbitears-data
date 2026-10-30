@@ -1,13 +1,13 @@
 <#
-  Builds RabbitEars' Discover tab data from TVMaze (https://www.tvmaze.com/api,
-  CC BY-SA 4.0). Run it after build-catalog.ps1, whose catalog.tsv it reads from
-  the same output folder:
+  Builds RabbitEars' Discover data from TVMaze (https://www.tvmaze.com/api,
+  CC BY-SA 4.0). Run it after build-catalog.ps1, whose catalog.tsv and
+  catalog-meta.tsv it reads from the same output folder:
 
       powershell -ExecutionPolicy Bypass -File tools\build-discover.ps1
 
   Writes (to public/ unless -OutDir says otherwise):
     discover.json        the lists (show ids + display info)
-    discover/<id>.jpg    a small poster for every listed show
+    discover/<id>.jpg    a small poster for every show on a default (unfiltered) list
 
   How the lists are made (also explained on the app's Info page):
     Top 50 of all time  Highest TVMaze rating among widely followed shows
@@ -22,9 +22,14 @@
                         popularity weight, then rating.
   News, talk, sports and award shows are left out of every list.
 
-  Takes ~20 minutes (TVMaze allows ~20 requests per 10 s). To re-rank only the top
-  and by-year lists, keeping the trending lists (and their date) from the current
-  discover.json, add -ReuseTrending (~10 minutes).
+  Besides each default list, discover.json carries the full ranked "pool" behind
+  it (topPool, yearPools, trendingPools) plus every pooled show's categories and
+  network, so the app can filter by category and streaming service on the phone.
+  The default lists (top, byYear, trending) are kept for older app versions.
+
+  Takes ~10 minutes (TVMaze allows ~20 requests per 10 s). To re-rank only the top
+  and by-year lists, keeping the trending pools (and their date) from the current
+  discover.json, add -ReuseTrending (~1 minute).
 #>
 param(
     [int]$Days = 365,          # schedule history to scan for trending
@@ -36,9 +41,12 @@ param(
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 
-$assets = $OutDir
-$posterDir = Join-Path $assets 'discover'
+$posterDir = Join-Path $OutDir 'discover'
+$jsonPath = Join-Path $OutDir 'discover.json'
 $excludedTypes = @('News', 'Talk Show', 'Sports', 'Award Show')
+# Show types offered as categories alongside TVMaze's genres.
+$typeCategories = @('Animation', 'Documentary', 'Reality')
+$trendingPoolSize = 300
 
 function Get-Json([string]$url) {
     while ($true) {
@@ -55,143 +63,147 @@ function Get-Json([string]$url) {
     }
 }
 
-function Network-Of($show) {
-    if ($show.network) { return $show.network.name }
-    if ($show.webChannel) { return $show.webChannel.name }
-    return ''
-}
-
-# ── Catalog (id, name, year, network, status, weight, rating) ─────────────
+# ── Catalog + meta ────────────────────────────────────────────────────────
 $catalog = @{}
-foreach ($line in [IO.File]::ReadAllLines((Join-Path $assets 'catalog.tsv'), [Text.Encoding]::UTF8)) {
+foreach ($line in [IO.File]::ReadAllLines((Join-Path $OutDir 'catalog.tsv'), [Text.Encoding]::UTF8)) {
     $f = $line -split "`t"
     $catalog[[int]$f[0]] = [pscustomobject]@{
         id = [int]$f[0]; name = $f[1]; year = $f[2]; network = $f[3]; status = $f[4]
         weight = [int]$f[5]; rating = if ($f.Count -gt 6 -and $f[6]) { [double]$f[6] } else { $null }
+        image = if ($f.Count -gt 7) { $f[7] } else { '' }
+        type = ''; cats = @()
     }
+}
+foreach ($line in [IO.File]::ReadAllLines((Join-Path $OutDir 'catalog-meta.tsv'), [Text.Encoding]::UTF8)) {
+    $f = $line -split "`t"
+    $c = $catalog[[int]$f[0]]
+    if (-not $c) { continue }
+    $c.type = $f[1]
+    $genres = if ($f.Count -gt 2 -and $f[2]) { $f[2] -split '\|' } else { @() }
+    $c.cats = @($genres) + @($typeCategories | Where-Object { $_ -eq $c.type })
 }
 Write-Host "catalog: $($catalog.Count) shows"
 
-# Full details (type, poster URL) for every show a list might use, fetched once each.
-$details = @{}
-function Detail([int]$id) {
-    if (-not $details.ContainsKey($id)) { $details[$id] = Get-Json "https://api.tvmaze.com/shows/$id" }
-    return $details[$id]
-}
-function Is-Listable([int]$id) {
-    $d = Detail $id
-    return $d -and ($excludedTypes -notcontains $d.type)
+$listable = $catalog.Values | Where-Object { $excludedTypes -notcontains $_.type }
+$rated = $listable | Where-Object { $null -ne $_.rating }
+
+function Rank-ByRating($shows, [int]$take) {
+    return , @($shows | Sort-Object @{ e = 'rating'; Descending = $true }, @{ e = 'weight'; Descending = $true }, name |
+        Select-Object -First $take | ForEach-Object { $_.id })
 }
 
-function Rank-ByRating($candidates, [int]$take) {
-    $picked = @()
-    foreach ($c in ($candidates | Sort-Object @{ e = 'rating'; Descending = $true }, @{ e = 'weight'; Descending = $true }, name)) {
-        if ($picked.Count -ge $take) { break }
-        if (Is-Listable $c.id) { $picked += $c.id }
-    }
-    return , $picked
-}
+# ── Top of all time ───────────────────────────────────────────────────────
+# Deep enough that a filtered list (one category on one service) still finds 50.
+$topPool = Rank-ByRating ($rated | Where-Object { $_.weight -ge 97 }) 1500
+Write-Host "top pool: $($topPool.Count)"
 
-# ── Top 50 of all time ────────────────────────────────────────────────────
-$rated = $catalog.Values | Where-Object { $null -ne $_.rating }
-$top = Rank-ByRating ($rated | Where-Object { $_.weight -ge 97 }) 50
-Write-Host "top: $($top.Count)"
-
-# ── Top 10 by premiere year ───────────────────────────────────────────────
+# ── Top by premiere year ──────────────────────────────────────────────────
 $thisYear = (Get-Date).Year
-$byYear = [ordered]@{}
+$yearPools = [ordered]@{}
 for ($y = $thisYear; $y -ge $FirstYear; $y--) {
     # Brand-new shows can carry a high rating from few votes, so the two most recent
     # years need the same popularity bar as the all-time list.
     $cutoff = if ($y -ge $thisYear - 1) { 97 } else { 90 }
-    $ids = Rank-ByRating ($rated | Where-Object { $_.year -eq "$y" -and $_.weight -ge $cutoff }) 10
-    if ($ids.Count -gt 0) { $byYear["$y"] = $ids }
-    Write-Host "year $y : $($ids.Count)"
+    $ids = Rank-ByRating ($rated | Where-Object { $_.year -eq "$y" -and $_.weight -ge $cutoff }) 150
+    if ($ids.Count -gt 0) { $yearPools["$y"] = $ids }
 }
+Write-Host "years: $($yearPools.Count), pooled shows: $(($yearPools.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum)"
 
 # ── Trending: scan the schedules ──────────────────────────────────────────
-# For each show, the most recent day (as days ago) it released an episode.
-$lastAired = @{}
-$today = (Get-Date).Date
-$jsonPath = Join-Path $assets 'discover.json'
+$today = (Get-Date).ToUniversalTime().Date   # UTC, like the GitHub runner, so dates agree wherever this runs
 $previous = if ($ReuseTrending) { [IO.File]::ReadAllText($jsonPath, [Text.Encoding]::UTF8) | ConvertFrom-Json } else { $null }
-if ($previous) { $Days = 0; Write-Host "reusing trending lists from $($previous.updated)" }
-for ($d = 0; $d -lt $Days; $d++) {
-    $date = $today.AddDays(-$d).ToString('yyyy-MM-dd')
-    $entries = @()
-    $us = Get-Json "https://api.tvmaze.com/schedule?country=US&date=$date"
-    if ($us) { $entries += $us | ForEach-Object { $_.show } }
-    $web = Get-Json "https://api.tvmaze.com/schedule/web?date=$date"
-    if ($web) { $entries += $web | ForEach-Object { $_._embedded.show } }
-    foreach ($s in $entries) {
-        if (-not $s) { continue }
-        $id = [int]$s.id
-        if (-not $details.ContainsKey($id)) { $details[$id] = $s }   # schedule embeds full show info
-        if (-not $lastAired.ContainsKey($id) -or $lastAired[$id] -gt $d) { $lastAired[$id] = $d }
-    }
-    if ($d % 10 -eq 0) { Write-Host "schedule $date : $($lastAired.Count) shows so far" }
-}
-
-function Trending([int]$window) {
-    $candidates = $lastAired.Keys | Where-Object { $lastAired[$_] -lt $window -and $catalog.ContainsKey($_) } |
-        ForEach-Object { $catalog[$_] } |
-        Where-Object { $excludedTypes -notcontains $details[$_.id].type }
-    $sorted = $candidates | Sort-Object @{ e = 'weight'; Descending = $true },
-        @{ e = { if ($null -eq $_.rating) { -1 } else { $_.rating } }; Descending = $true }, name
-    return , @($sorted | Select-Object -First 20 | ForEach-Object { $_.id })
-}
-if ($previous) {
-    $trending = [ordered]@{}
-    foreach ($w in 'week', 'month', 'quarter', 'year') { $trending[$w] = @($previous.trending.$w) }
+$trendingPools = [ordered]@{}
+if ($previous -and $previous.trendingPools) {
+    foreach ($w in 'week', 'month', 'quarter', 'year') { $trendingPools[$w] = @($previous.trendingPools.$w) }
     $today = [datetime]::ParseExact($previous.updated, 'yyyy-MM-dd', $null)   # trending is still as of then
+    Write-Host "reusing trending pools from $($previous.updated)"
 } else {
-    $trending = [ordered]@{
-        week    = Trending 7
-        month   = Trending 30
-        quarter = Trending 91
-        year    = Trending 365
+    # For each show, the most recent day (as days ago) it released an episode.
+    $lastAired = @{}
+    for ($d = 0; $d -lt $Days; $d++) {
+        $date = $today.AddDays(-$d).ToString('yyyy-MM-dd')
+        $ids = @()
+        $us = Get-Json "https://api.tvmaze.com/schedule?country=US&date=$date"
+        if ($us) { $ids += $us | ForEach-Object { $_.show.id } }
+        $web = Get-Json "https://api.tvmaze.com/schedule/web?date=$date"
+        if ($web) { $ids += $web | ForEach-Object { $_._embedded.show.id } }
+        foreach ($id in $ids) {
+            if ($null -eq $id) { continue }
+            $id = [int]$id
+            if (-not $lastAired.ContainsKey($id) -or $lastAired[$id] -gt $d) { $lastAired[$id] = $d }
+        }
+        if ($d % 30 -eq 0) { Write-Host "schedule $date : $($lastAired.Count) shows so far" }
+    }
+    $airedShows = $lastAired.Keys | Where-Object { $catalog.ContainsKey($_) } | ForEach-Object { $catalog[$_] } |
+        Where-Object { $excludedTypes -notcontains $_.type }
+    foreach ($w in @(@('week', 7), @('month', 30), @('quarter', 91), @('year', 365))) {
+        $trendingPools[$w[0]] = @($airedShows | Where-Object { $lastAired[$_.id] -lt $w[1] } |
+            Sort-Object @{ e = 'weight'; Descending = $true },
+                @{ e = { if ($null -eq $_.rating) { -1 } else { $_.rating } }; Descending = $true }, name |
+            Select-Object -First $trendingPoolSize | ForEach-Object { $_.id })
     }
 }
 
-# ── Show info + posters for everything listed ─────────────────────────────
-$listed = @($top) + @($byYear.Values | ForEach-Object { $_ }) + @($trending.Values | ForEach-Object { $_ }) | Sort-Object -Unique
-New-Item -ItemType Directory -Force $posterDir | Out-Null
-# Keep posters still in use (they rarely change); drop ones for shows no longer listed.
-Get-ChildItem $posterDir -Filter *.jpg | Where-Object { $listed -notcontains [int]$_.BaseName } | Remove-Item
+# ── Default lists (what older app versions show) ──────────────────────────
+$top = @($topPool | Select-Object -First 50)
+$byYear = [ordered]@{}
+foreach ($y in $yearPools.Keys) { $byYear[$y] = @($yearPools[$y] | Select-Object -First 10) }
+$trending = [ordered]@{}
+foreach ($w in $trendingPools.Keys) { $trending[$w] = @($trendingPools[$w] | Select-Object -First 20) }
+
+# ── Categories: genres common among the top shows, most common first ──────
+$catCounts = @{}
+foreach ($id in $topPool) { foreach ($cat in $catalog[$id].cats) { $catCounts[$cat] = 1 + [int]$catCounts[$cat] } }
+$categories = @($catCounts.Keys | Where-Object { $catCounts[$_] -ge 15 } | Sort-Object { -$catCounts[$_] }, { $_ })
+Write-Host "categories: $($categories -join ', ')"
+
+# ── Show info for every pooled show; posters for the default lists ─────────
+$pooled = @($topPool) + @($yearPools.Values | ForEach-Object { $_ }) + @($trendingPools.Values | ForEach-Object { $_ }) | Sort-Object -Unique
 $shows = [ordered]@{}
-$jpeg = [Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }
-$quality = New-Object Drawing.Imaging.EncoderParameters 1
-$quality.Param[0] = New-Object Drawing.Imaging.EncoderParameter ([Drawing.Imaging.Encoder]::Quality), 72L
-foreach ($id in $listed) {
+foreach ($id in $pooled) {
     $c = $catalog[$id]
     $shows["$id"] = [ordered]@{
         name = $c.name; year = $c.year; network = $c.network; status = $c.status; rating = $c.rating
+        cats = @($c.cats); image = $c.image
     }
-    if (Test-Path (Join-Path $posterDir "$id.jpg")) { continue }
-    $d = Detail $id
-    $url = if ($d -and $d.image) { $d.image.medium } else { $null }
-    if (-not $url) { continue }
+}
+
+$withPosters = @($top) + @($byYear.Values | ForEach-Object { $_ }) + @($trending.Values | ForEach-Object { $_ }) | Sort-Object -Unique
+New-Item -ItemType Directory -Force $posterDir | Out-Null
+# Keep posters still in use (they rarely change); drop ones for shows no longer listed.
+Get-ChildItem $posterDir -Filter *.jpg | Where-Object { $withPosters -notcontains [int]$_.BaseName } | Remove-Item
+$jpeg = [Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }
+$quality = New-Object Drawing.Imaging.EncoderParameters 1
+$quality.Param[0] = New-Object Drawing.Imaging.EncoderParameter ([Drawing.Imaging.Encoder]::Quality), 72L
+foreach ($id in $withPosters) {
+    $dest = Join-Path $posterDir "$id.jpg"
+    $image = $catalog[$id].image
+    if ((Test-Path $dest) -or -not $image) { continue }
     try {
-        $bytes = (Invoke-WebRequest -UseBasicParsing $url).RawContentStream.ToArray()
+        $bytes = (Invoke-WebRequest -UseBasicParsing "https://static.tvmaze.com/uploads/images/medium_portrait/$image.jpg").RawContentStream.ToArray()
         $src = [Drawing.Image]::FromStream((New-Object IO.MemoryStream (, $bytes)))
         $thumb = New-Object Drawing.Bitmap 120, 168
         $g = [Drawing.Graphics]::FromImage($thumb)
         $g.InterpolationMode = [Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
         $g.DrawImage($src, 0, 0, 120, 168)
-        $thumb.Save((Join-Path $posterDir "$id.jpg"), $jpeg, $quality)
+        $thumb.Save($dest, $jpeg, $quality)
         $g.Dispose(); $thumb.Dispose(); $src.Dispose()
     } catch {
-        Write-Host "poster failed for $id ($($c.name))"
+        Write-Host "poster failed for $id ($($catalog[$id].name))"
     }
 }
 
 $out = [ordered]@{
-    updated  = $today.ToString('yyyy-MM-dd')
-    top      = $top
-    byYear   = $byYear
-    trending = $trending
-    shows    = $shows
+    updated       = $today.ToString('yyyy-MM-dd')
+    categories    = $categories
+    top           = $top
+    byYear        = $byYear
+    trending      = $trending
+    topPool       = $topPool
+    yearPools     = $yearPools
+    trendingPools = $trendingPools
+    shows         = $shows
 }
 [IO.File]::WriteAllText($jsonPath, ($out | ConvertTo-Json -Depth 6 -Compress), (New-Object Text.UTF8Encoding $false))
 $size = (Get-ChildItem $posterDir | Measure-Object Length -Sum).Sum / 1MB
-Write-Host ("Wrote discover.json: {0} shows, posters {1:N1} MB" -f $shows.Count, $size)
+Write-Host ("Wrote discover.json: {0} shows ({1:N0} KB), posters {2:N1} MB" -f $shows.Count, ((Get-Item $jsonPath).Length / 1KB), $size)
