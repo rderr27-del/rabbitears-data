@@ -1,20 +1,20 @@
 ﻿{
-    "version":  "2026-11-02T1930Z",
+    "version":  "2026-11-09T1951Z",
     "files":  {
                   "catalog":  {
                                   "path":  "catalog.tsv.gz",
-                                  "bytes":  2313682,
-                                  "sha256":  "a0c8c8e3c169401002ffab2cd22b8330b869a1e0f75de0f712434e38441fd406"
+                                  "bytes":  2314497,
+                                  "sha256":  "66ebff6aadd39d6a6e3200d74c85ce73aa21496e3a14df68259aeea432de9017"
                               },
                   "discover":  {
                                    "path":  "discover.json",
-                                   "bytes":  569627,
-                                   "sha256":  "e36e09c000bead7cb45e98634393043f352ada048e3d06530dd1e3e3d3370d02"
+                                   "bytes":  563682,
+                                   "sha256":  "201cc6e57e7d6bcda6dc1fda440249a343b37baf3c300e0422f10e8f53ec71aa"
                                },
                   "posters":  {
                                   "path":  "discover-posters.zip",
-                                  "bytes":  3377198,
-                                  "sha256":  "5d4216cda0edff592935f45593fc18aa1a416321a3b9f702f7ed31582d5e7435"
+                                  "bytes":  3262019,
+                                  "sha256":  "397e09830c1c5f91f0a7f1897cbbe16af93a45e8ddb47b0552e009c503b99dfc"
                               }
               }
 }
