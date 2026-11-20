@@ -1,5 +1,6 @@
 # Rebuilds RabbitEars' show data from TVMaze every week and publishes it to
-# GitHub Pages, where the app picks it up. Takes ~30 minutes (TVMaze rate limits).
+# GitHub Pages, where the app picks it up. Takes ~30 minutes (TVMaze rate limits),
+# longer when the poster cache is empty.
 name: Weekly data
 
 on:
@@ -20,7 +21,7 @@ jobs:
   build:
     # Windows PowerShell 5.1 with System.Drawing, which the poster resizing uses.
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7
 
@@ -31,6 +32,19 @@ jobs:
       - name: Build Discover lists
         shell: powershell
         run: .\tools\build-discover.ps1 -OutDir public
+
+      # Posters are kept between weekly runs so only new or changed ones are
+      # downloaded. Each run saves a fresh cache entry; the newest is restored.
+      - name: Restore posters
+        uses: actions/cache@v6
+        with:
+          path: public/posters
+          key: posters-${{ github.run_id }}
+          restore-keys: posters-
+
+      - name: Copy posters of popular shows
+        shell: powershell
+        run: .\tools\build-posters.ps1 -OutDir public
 
       - name: Package feed
         shell: powershell

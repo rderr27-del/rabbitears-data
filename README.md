@@ -9,6 +9,7 @@ Weekly show data for the RabbitEars Android app, built from [TVMaze](https://www
 | `catalog.tsv.gz` | Every show on TVMaze, for search: id, name, year, network, status, popularity, rating, poster id |
 | `discover.json` | Discover lists: trending (week / month / 3 months / year), top 50 of all time, top 10 by year |
 | `discover-posters.zip` | Small posters for every show on a Discover list |
+| `posters/<id>.jpg` | TVMaze's poster for every popular show (weight ≥ 80, ~8,500 shows) and every Discover show, fetched by the app when a show is added. Not listed in the manifest. |
 
 ## How it's built
 
@@ -17,7 +18,8 @@ Weekly show data for the RabbitEars Android app, built from [TVMaze](https://www
 
 1. `tools/build-catalog.ps1`: TVMaze's full show index → `catalog.tsv` (~6 min)
 2. `tools/build-discover.ps1`: ranks the Discover lists and resizes their posters (~20 min)
-3. `tools/build-feed.ps1`: compresses everything and writes `manifest.json`
+3. `tools/build-posters.ps1`: copies new or changed posters of popular shows (kept between runs in the Actions cache; a full download takes ~30–60 min)
+4. `tools/build-feed.ps1`: compresses everything and writes `manifest.json`
 
 The same scripts run on a Windows PC; output goes to `public/`.
 
