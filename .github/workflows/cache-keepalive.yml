@@ -1,0 +1,33 @@
+# Keeps the weekly poster cache from expiring. GitHub deletes a cache nobody has
+# used for 7 days, and the weekly run (weekly-data.yml) comes round every 7 days,
+# often starting hours late, so it could find its cache just gone and have to
+# download every poster from TVMaze again (~1 hour). Opening the cache mid-week
+# resets that 7-day clock. Nothing is downloaded from TVMaze and nothing is published.
+name: Poster cache keep-alive
+
+on:
+  schedule:
+    - cron: "0 9 * * 4" # Thursdays 09:00 UTC, halfway between Mondays
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  touch-cache:
+    # Same OS as the weekly run: a cache saved on Windows only opens on Windows.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Open the poster cache
+        uses: actions/cache/restore@v6
+        with:
+          path: public/posters
+          key: posters-keepalive
+          restore-keys: posters-
+
+      - name: Report
+        shell: powershell
+        run: |
+          $n = @(Get-ChildItem public\posters -Filter *.jpg -ErrorAction SilentlyContinue).Count
+          if ($n -eq 0) { Write-Host "::warning::No poster cache found; the next weekly run will download every poster again." }
+          else { Write-Host "Poster cache is alive: $n posters." }

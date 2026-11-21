@@ -17,9 +17,11 @@ Weekly show data for the RabbitEars Android app, built from [TVMaze](https://www
 *Weekly data* → *Run workflow*):
 
 1. `tools/build-catalog.ps1`: TVMaze's full show index → `catalog.tsv` (~6 min)
-2. `tools/build-discover.ps1`: ranks the Discover lists and resizes their posters (~20 min)
+2. `tools/build-discover.ps1`: ranks the Discover lists and resizes their posters. For trending it reads only the TV schedule days it hasn't seen yet, remembering earlier ones in `history/last-aired.tsv` (committed each week), with a full one-year rescan every 4 weeks (a few minutes; ~20 min with a full rescan)
 3. `tools/build-posters.ps1`: copies new or changed posters of popular shows (kept between runs in the Actions cache; a full download takes ~30–60 min)
 4. `tools/build-feed.ps1`: compresses everything and writes `manifest.json`
+
+`.github/workflows/cache-keepalive.yml` opens the poster cache every Thursday, so GitHub's 7-day cache expiry can't delete it between weekly runs.
 
 The same scripts run on a Windows PC; output goes to `public/`.
 

@@ -27,14 +27,37 @@
   network, so the app can filter by category and streaming service on the phone.
   The default lists (top, byYear, trending) are kept for older app versions.
 
-  Takes ~10 minutes (TVMaze allows ~20 requests per 10 s). To re-rank only the top
-  and by-year lists, keeping the trending pools (and their date) from the current
-  discover.json, add -ReuseTrending (~1 minute).
+  Trending history (history/last-aired.tsv, committed to the repo): for every show
+  that aired in the last -Days days, the latest date it released an episode, plus
+  the date the history covers up to and the date of its last full scan. Instead of
+  re-reading a whole year of schedules every week (~730 requests), a run reads only
+  the days since the history's date, plus the last -Overlap days again because
+  TVMaze sometimes adds episodes to past dates late (~20 requests a week). Every
+  -FullScanEvery days, or whenever the history is missing or doesn't look right, it
+  does a full scan instead and starts the history afresh, so a mistake can't carry
+  on for more than a few weeks. -FullScan forces one.
+
+  Takes ~10-20 minutes with a full scan, a few minutes otherwise (TVMaze allows ~20
+  requests per 10 s). To re-rank only the top and by-year lists, keeping the
+  trending pools (and their date) from the current discover.json, add
+  -ReuseTrending (~1 minute).
+
+  Discover thumbnails are made from the full-size posters build-posters.ps1 keeps in
+  posters/ (restored from the Actions cache) when they're there and current, and
+  downloaded from TVMaze otherwise.
+
+  -AsOf yyyy-MM-dd pretends today is that date (UTC), for testing the history.
 #>
 param(
     [int]$Days = 365,          # schedule history to scan for trending
     [int]$FirstYear = 1950,
     [switch]$ReuseTrending,
+    [switch]$FullScan,
+    [int]$Overlap = 14,        # days already in the history to read again
+    [int]$FullScanEvery = 28,  # days between full scans
+    [int]$MinHistory = 1000,   # fewer shows than this in the history means something went wrong
+    [string]$AsOf = '',
+    [string]$HistoryPath = (Join-Path (Split-Path -Parent $PSScriptRoot) 'history\last-aired.tsv'),
     [string]$OutDir = (Join-Path (Split-Path -Parent $PSScriptRoot) 'public')
 )
 
@@ -110,18 +133,59 @@ for ($y = $thisYear; $y -ge $FirstYear; $y--) {
 Write-Host "years: $($yearPools.Count), pooled shows: $(($yearPools.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum)"
 
 # ── Trending: scan the schedules ──────────────────────────────────────────
-$today = (Get-Date).ToUniversalTime().Date   # UTC, like the GitHub runner, so dates agree wherever this runs
+# UTC, like the GitHub runner, so dates agree wherever this runs.
+$today = if ($AsOf) { [datetime]::ParseExact($AsOf, 'yyyy-MM-dd', $null) } else { (Get-Date).ToUniversalTime().Date }
 $previous = if ($ReuseTrending) { [IO.File]::ReadAllText($jsonPath, [Text.Encoding]::UTF8) | ConvertFrom-Json } else { $null }
 $trendingPools = [ordered]@{}
+$historyLines = $null   # set when the history changes; written once discover.json is
 if ($previous -and $previous.trendingPools) {
     foreach ($w in 'week', 'month', 'quarter', 'year') { $trendingPools[$w] = @($previous.trendingPools.$w) }
     $today = [datetime]::ParseExact($previous.updated, 'yyyy-MM-dd', $null)   # trending is still as of then
     Write-Host "reusing trending pools from $($previous.updated)"
 } else {
-    # For each show, the most recent day (as days ago) it released an episode.
+    # For each show, the latest date (UTC) it released an episode. Kept between runs
+    # in the history file, so a run only reads the days the history doesn't cover yet.
     $lastAired = @{}
-    for ($d = 0; $d -lt $Days; $d++) {
-        $date = $today.AddDays(-$d).ToString('yyyy-MM-dd')
+    $covered = $null; $lastFull = $null
+    $why = $null   # why this run does a full scan
+    if ($FullScan) { $why = 'asked for (-FullScan)' }
+    elseif (-not (Test-Path $HistoryPath)) { $why = 'no history yet' }
+    else {
+        try {
+            foreach ($line in [IO.File]::ReadAllLines($HistoryPath)) {
+                if (-not $line -or $line.StartsWith('#')) { continue }
+                $f = $line -split "`t"
+                if ($f.Count -ne 2) { throw "bad line: $line" }
+                $date = [datetime]::ParseExact($f[1], 'yyyy-MM-dd', $null)
+                switch ($f[0]) {
+                    'covered'  { $covered = $date }
+                    'fullscan' { $lastFull = $date }
+                    default    { $lastAired[[int]$f[0]] = $date }
+                }
+            }
+            if (-not $covered -or -not $lastFull) { $why = 'history has no dates' }
+            elseif ($lastAired.Count -lt $MinHistory) { $why = "history has only $($lastAired.Count) shows" }
+            elseif ($covered -gt $today -or $lastFull -gt $covered) { $why = 'history dates are in the future' }
+            elseif ($covered -le $today.AddDays(-$Days)) { $why = "history is too old ($($covered.ToString('yyyy-MM-dd')))" }
+            elseif (($today - $lastFull).Days -ge $FullScanEvery) { $why = "last full scan was $($lastFull.ToString('yyyy-MM-dd'))" }
+        } catch {
+            $why = "history unreadable ($($_.Exception.Message))"
+        }
+    }
+    if ($why) {
+        Write-Host "trending: full scan of $Days days ($why)"
+        $lastAired = @{}
+        $lastFull = $today
+        $start = $today.AddDays( - ($Days - 1))
+    } else {
+        $start = $covered.AddDays(1 - $Overlap)
+        Write-Host ("trending: history covers to {0} ({1} shows, full scan {2}); reading {3} days" -f
+            $covered.ToString('yyyy-MM-dd'), $lastAired.Count, $lastFull.ToString('yyyy-MM-dd'), (($today - $start).Days + 1))
+    }
+
+    $seen = 0
+    for ($day = $start; $day -le $today; $day = $day.AddDays(1)) {
+        $date = $day.ToString('yyyy-MM-dd')
         $ids = @()
         $us = Get-Json "https://api.tvmaze.com/schedule?country=US&date=$date"
         if ($us) { $ids += $us | ForEach-Object { $_.show.id } }
@@ -130,14 +194,32 @@ if ($previous -and $previous.trendingPools) {
         foreach ($id in $ids) {
             if ($null -eq $id) { continue }
             $id = [int]$id
-            if (-not $lastAired.ContainsKey($id) -or $lastAired[$id] -gt $d) { $lastAired[$id] = $d }
+            $seen++
+            if (-not $lastAired.ContainsKey($id) -or $lastAired[$id] -lt $day) { $lastAired[$id] = $day }
         }
-        if ($d % 30 -eq 0) { Write-Host "schedule $date : $($lastAired.Count) shows so far" }
+        if ($day.Day -eq 1) { Write-Host "schedule $date : $($lastAired.Count) shows so far" }
     }
+    # Every day has something on, so nothing at all means TVMaze answered with empty
+    # schedules. Stop here rather than save a history (and lists) built on that.
+    if ($seen -eq 0) { throw 'TVMaze schedules came back empty' }
+
+    # Forget shows that haven't aired within the window, then work in days ago.
+    $oldest = $today.AddDays( - ($Days - 1))
+    foreach ($id in @($lastAired.Keys)) { if ($lastAired[$id] -lt $oldest) { $lastAired.Remove($id) } }
+    $daysAgo = @{}
+    foreach ($id in $lastAired.Keys) { $daysAgo[$id] = ($today - $lastAired[$id]).Days }
+    Write-Host "trending: $($lastAired.Count) shows aired in the last $Days days"
+
+    $historyLines = New-Object System.Collections.Generic.List[string]
+    $historyLines.Add('# Trending history for build-discover.ps1: show id <TAB> latest date it aired (UTC).')
+    $historyLines.Add("covered`t$($today.ToString('yyyy-MM-dd'))")
+    $historyLines.Add("fullscan`t$($lastFull.ToString('yyyy-MM-dd'))")
+    foreach ($id in ($lastAired.Keys | Sort-Object)) { $historyLines.Add("$id`t$($lastAired[$id].ToString('yyyy-MM-dd'))") }
+
     $airedShows = $lastAired.Keys | Where-Object { $catalog.ContainsKey($_) } | ForEach-Object { $catalog[$_] } |
         Where-Object { $excludedTypes -notcontains $_.type }
     foreach ($w in @(@('week', 7), @('month', 30), @('quarter', 91), @('year', 365))) {
-        $trendingPools[$w[0]] = @($airedShows | Where-Object { $lastAired[$_.id] -lt $w[1] } |
+        $trendingPools[$w[0]] = @($airedShows | Where-Object { $daysAgo[$_.id] -lt $w[1] } |
             Sort-Object @{ e = 'weight'; Descending = $true },
                 @{ e = { if ($null -eq $_.rating) { -1 } else { $_.rating } }; Descending = $true }, name |
             Select-Object -First $trendingPoolSize | ForEach-Object { $_.id })
@@ -175,12 +257,30 @@ Get-ChildItem $posterDir -Filter *.jpg | Where-Object { $withPosters -notcontain
 $jpeg = [Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }
 $quality = New-Object Drawing.Imaging.EncoderParameters 1
 $quality.Param[0] = New-Object Drawing.Imaging.EncoderParameter ([Drawing.Imaging.Encoder]::Quality), 72L
+# Full-size posters build-posters.ps1 kept from earlier runs (id <TAB> TVMaze image
+# path), so thumbnails can be made from them instead of asking TVMaze again.
+$fullPosters = @{}
+$fullIndex = Join-Path $OutDir 'posters\index.tsv'
+if (Test-Path $fullIndex) {
+    foreach ($line in [IO.File]::ReadLines($fullIndex)) {
+        $f = $line.Split("`t")
+        if ($f.Count -eq 2) { $fullPosters[[int]$f[0]] = $f[1] }
+    }
+}
+$fromCache = 0; $fromTvMaze = 0
 foreach ($id in $withPosters) {
     $dest = Join-Path $posterDir "$id.jpg"
     $image = $catalog[$id].image
     if ((Test-Path $dest) -or -not $image) { continue }
     try {
-        $bytes = (Invoke-WebRequest -UseBasicParsing "https://static.tvmaze.com/uploads/images/medium_portrait/$image.jpg").RawContentStream.ToArray()
+        $cached = Join-Path $OutDir "posters\$id.jpg"
+        if ($fullPosters[$id] -eq $image -and (Test-Path $cached)) {
+            $bytes = [IO.File]::ReadAllBytes($cached)
+            $fromCache++
+        } else {
+            $bytes = (Invoke-WebRequest -UseBasicParsing "https://static.tvmaze.com/uploads/images/medium_portrait/$image.jpg").RawContentStream.ToArray()
+            $fromTvMaze++
+        }
         $src = [Drawing.Image]::FromStream((New-Object IO.MemoryStream (, $bytes)))
         $thumb = New-Object Drawing.Bitmap 120, 168
         $g = [Drawing.Graphics]::FromImage($thumb)
@@ -205,5 +305,16 @@ $out = [ordered]@{
     shows         = $shows
 }
 [IO.File]::WriteAllText($jsonPath, ($out | ConvertTo-Json -Depth 6 -Compress), (New-Object Text.UTF8Encoding $false))
+Write-Host "discover thumbnails: $fromCache from cached posters, $fromTvMaze from TVMaze"
+
+# The history is saved only now, after discover.json, so a run that fails part-way
+# leaves the old history in place. Temp file + rename, so it's never half-written.
+if ($historyLines) {
+    New-Item -ItemType Directory -Force (Split-Path -Parent $HistoryPath) | Out-Null
+    $temp = "$HistoryPath.tmp"
+    [IO.File]::WriteAllLines($temp, [string[]]$historyLines.ToArray(), (New-Object Text.UTF8Encoding $false))
+    Move-Item -Force $temp $HistoryPath
+    Write-Host "wrote trending history: $($historyLines.Count - 3) shows"
+}
 $size = (Get-ChildItem $posterDir | Measure-Object Length -Sum).Sum / 1MB
 Write-Host ("Wrote discover.json: {0} shows ({1:N0} KB), posters {2:N1} MB" -f $shows.Count, ((Get-Item $jsonPath).Length / 1KB), $size)
